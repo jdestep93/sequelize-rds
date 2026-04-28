@@ -1,0 +1,56 @@
+{
+  "name": "sequelize-rds",
+  "version": "0.1.0",
+  "description": "Dynamic RDS/Aurora reader pool synchronization for Sequelize.",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "sequelize",
+    "rds",
+    "aurora",
+    "replication",
+    "read-replica"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@aws-sdk/client-rds": "^3.787.0",
+    "sequelize-pool": "^7.1.0"
+  },
+  "peerDependencies": {
+    "@sequelize/core": ">=7.0.0-alpha.0 <8",
+    "sequelize": "^6.37.0"
+  },
+  "peerDependenciesMeta": {
+    "@sequelize/core": {
+      "optional": true
+    },
+    "sequelize": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.2"
+  }
+}
