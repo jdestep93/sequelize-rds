@@ -1,4 +1,4 @@
-export { NoActiveReadersError, RdsReplicaBalancerError, RdsTopologyError } from "./errors.js";
+export { NoActiveReadersError, RdsReplicaBalancerError, RdsTopologyError, ReadConsistencyContextError } from "./errors.js";
 export { RdsReplicaBalancerController } from "./balancer.js";
 export { discoverRdsTopology } from "./topology.js";
 export type {
@@ -7,6 +7,9 @@ export type {
   RdsClusterTopology,
   RdsEndpoint,
   RdsReaderEndpoint,
+  RdsReaderLagOptions,
+  RdsReaderState,
+  RdsReadConsistencyOptions,
   RdsReplicaBalancer,
   RdsReplicaBalancerLogger,
   RdsReplicaBalancerOptions,
