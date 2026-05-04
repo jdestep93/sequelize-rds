@@ -1,7 +1,15 @@
 {
   "name": "sequelize-rds",
-  "version": "0.1.0",
+  "version": "0.1.0-alpha.0",
   "description": "Dynamic RDS/Aurora reader pool synchronization for Sequelize.",
+  "homepage": "https://github.com/jdestep93/sequelize-rds#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jdestep93/sequelize-rds.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jdestep93/sequelize-rds/issues"
+  },
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -18,10 +26,16 @@
     "README.md",
     "LICENSE"
   ],
+  "publishConfig": {
+    "tag": "alpha"
+  },
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts --clean",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "npm run test:unit",
+    "test:unit": "vitest run --config vitest.config.ts",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:all": "npm run test:unit && npm run typecheck && npm run build && npm run test:integration"
   },
   "keywords": [
     "sequelize",
@@ -48,7 +62,14 @@
     }
   },
   "devDependencies": {
+    "@sequelize/core": "^7.0.0-alpha.48",
+    "@sequelize/mysql": "^7.0.0-alpha.48",
+    "@sequelize/postgres": "^7.0.0-alpha.48",
     "@types/node": "^22.15.3",
+    "mysql2": "^3.15.3",
+    "pg": "^8.20.0",
+    "sequelize": "^6.37.8",
+    "testcontainers": "^11.14.0",
     "tsup": "^8.4.0",
     "typescript": "^5.8.3",
     "vitest": "^3.1.2"

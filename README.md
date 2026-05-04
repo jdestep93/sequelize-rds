@@ -2,6 +2,8 @@
 
 Dynamic RDS/Aurora reader pool synchronization for Sequelize.
 
+> Alpha software: `sequelize-rds` is published as `0.1.0-alpha.0` and should be validated in your staging environment before production use. Sequelize v7 support is experimental because Sequelize v7 is still alpha.
+
 `sequelize-rds` keeps Sequelize read traffic aligned with the current members of an AWS RDS/Aurora cluster. It polls RDS cluster topology, routes reads to active reader instance endpoints, adds new readers without recreating Sequelize, and drains readers that AWS reports as removed or unavailable.
 
 It does not create, delete, or scale RDS resources.
@@ -23,6 +25,50 @@ or:
 ```sh
 npm install @sequelize/core
 ```
+
+## Test status
+
+The package includes two test layers:
+
+```sh
+npm run test:unit
+npm run test:integration
+```
+
+`test:unit` runs the fast mocked RDS and pool tests. `test:integration` uses Testcontainers and Docker to run real Sequelize v6 and Sequelize v7 alpha instances against Postgres and MySQL containers. Integration tests skip automatically when Docker is unavailable.
+
+CI runs:
+
+```sh
+npm ci
+npm run typecheck
+npm run test:unit
+npm run build
+npm run test:integration
+```
+
+## npm CI/CD
+
+GitHub Actions includes:
+
+- `.github/workflows/ci.yml`: runs on pushes and pull requests to `main`.
+- `.github/workflows/publish-npm.yml`: runs on published GitHub releases or manual `workflow_dispatch`.
+
+The publish workflow runs typecheck, unit tests, build, and integration tests before publishing. It publishes with npm provenance enabled.
+
+Publishing supports either:
+
+- npm trusted publishing for this GitHub repository, using the workflow name `Publish npm`.
+- a GitHub Actions secret named `NPM_TOKEN` containing a granular npm token with package publish permission and 2FA bypass if your npm account requires it.
+
+The npm dist-tag is inferred from `package.json`:
+
+- `*-alpha*` -> `alpha`
+- `*-beta*` -> `beta`
+- `*-rc*` -> `next`
+- otherwise -> `latest`
+
+Manual workflow runs can override the dist-tag with the `npm-tag` input.
 
 ## Basic usage
 

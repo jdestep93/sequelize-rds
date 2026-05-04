@@ -22,19 +22,19 @@ interface AdapterContext {
 }
 
 export function installSequelizePoolAdapter(sequelize: SequelizeLike, options: AdapterContext["options"]): SequelizePoolAdapter {
-  if (sequelize.connectionManager?.pool) {
-    return installV6Adapter({ sequelize, options });
+  if (safeGet(sequelize, "pool")) {
+    return installV7Adapter({ sequelize, options });
   }
 
-  if (sequelize.pool) {
-    return installV7Adapter({ sequelize, options });
+  if (safeConnectionManager(sequelize)?.pool) {
+    return installV6Adapter({ sequelize, options });
   }
 
   throw new RdsReplicaBalancerError("Unable to find a Sequelize connection pool to wrap.");
 }
 
 function installV6Adapter(context: AdapterContext): SequelizePoolAdapter {
-  const connectionManager = context.sequelize.connectionManager;
+  const connectionManager = safeConnectionManager(context.sequelize);
 
   if (!connectionManager?.pool) {
     throw new RdsReplicaBalancerError("Sequelize v6 connectionManager.pool was not found.");
@@ -58,14 +58,14 @@ function installV6Adapter(context: AdapterContext): SequelizePoolAdapter {
 }
 
 function installV7Adapter(context: AdapterContext): SequelizePoolAdapter {
-  const originalPool = context.sequelize.pool;
+  const originalPool = safeGet(context.sequelize, "pool");
 
   if (!originalPool) {
     throw new RdsReplicaBalancerError("Sequelize v7 pool was not found.");
   }
 
   const poolDelegate = originalPool as PoolDelegate & Record<string, unknown>;
-  const dynamicReads = createDynamicReadPool(context, poolDelegate);
+  const dynamicReads = createDynamicReadPool(context, createV7WriteFallbackDelegate(poolDelegate));
   const facade = new V7PoolFacade(poolDelegate, dynamicReads);
   context.sequelize.pool = facade;
 
@@ -219,6 +219,16 @@ function createDynamicReadPool(context: AdapterContext, writePool: PoolDelegate)
   });
 }
 
+function createV7WriteFallbackDelegate(originalPool: PoolDelegate & Record<string, unknown>): PoolDelegate {
+  return {
+    acquire: () => originalPool.acquire({ type: "write", useMaster: true }),
+    release: (connection) => originalPool.release(connection),
+    destroy: (connection) => originalPool.destroy(connection),
+    drain: () => originalPool.drain?.(),
+    destroyAllNow: () => originalPool.destroyAllNow?.(),
+  };
+}
+
 function readersToConfigs(
   sequelize: SequelizeLike,
   readers: RdsReaderEndpoint[],
@@ -241,7 +251,7 @@ function getPoolOptions(sequelize: SequelizeLike): {
   evict: number;
   maxUses?: number;
 } {
-  const source = objectAt(sequelize.connectionManager?.config, "pool") ?? objectAt(sequelize.options, "pool") ?? {};
+  const source = objectAt(safeConnectionManager(sequelize)?.config, "pool") ?? objectAt(sequelize.options, "pool") ?? {};
 
   return {
     max: numberOrDefault(source.max, 5),
@@ -254,14 +264,14 @@ function getPoolOptions(sequelize: SequelizeLike): {
 }
 
 function getBaseReadConfig(sequelize: SequelizeLike): Record<string, unknown> {
-  const config = sequelize.connectionManager?.config ?? sequelize.config ?? {};
+  const config = safeConnectionManager(sequelize)?.config ?? sequelize.config ?? {};
   const options = sequelize.options ?? {};
   const replication = objectAt(config, "replication") ?? objectAt(options, "replication");
-  const read = Array.isArray(replication.read) ? replication.read[0] : replication.read;
+  const read = Array.isArray(replication?.read) ? replication.read[0] : replication?.read;
 
   return {
     ...configWithoutReplication(config),
-    ...configWithoutReplication(options),
+    ...(replication ? {} : connectionOptionsFrom(options)),
     ...objectAt(replication, "write"),
     ...objectAt(read),
   };
@@ -277,10 +287,10 @@ function updateWriteHost(
   }
 
   const targets = [
-    sequelize.connectionManager?.config,
+    safeConnectionManager(sequelize)?.config,
     sequelize.config,
     sequelize.options,
-    objectAt(sequelize.connectionManager?.config, "replication")?.write,
+    objectAt(safeConnectionManager(sequelize)?.config, "replication")?.write,
     objectAt(sequelize.options, "replication")?.write,
   ];
 
@@ -300,7 +310,7 @@ function updateWriteHost(
 }
 
 async function connect(sequelize: SequelizeLike, config: Record<string, unknown>): Promise<unknown> {
-  const manager = sequelize.connectionManager as
+  const manager = safeConnectionManager(sequelize) as
     | {
         _connect?: (config: Record<string, unknown>) => Promise<unknown>;
       }
@@ -313,21 +323,19 @@ async function connect(sequelize: SequelizeLike, config: Record<string, unknown>
   const anySequelize = sequelize as Record<string, any>;
   const clonedConfig = { ...config };
 
-  await anySequelize.hooks?.runAsync?.("beforeConnect", clonedConfig);
-  await anySequelize.runHooks?.("beforeConnect", clonedConfig);
+  await runSequelizeHook(anySequelize, "beforeConnect", clonedConfig);
   const connection = await anySequelize.dialect?.connectionManager?.connect?.(clonedConfig);
 
   if (!connection) {
     throw new RdsReplicaBalancerError("Unable to create a Sequelize connection for an RDS reader.");
   }
 
-  await anySequelize.hooks?.runAsync?.("afterConnect", connection, clonedConfig);
-  await anySequelize.runHooks?.("afterConnect", connection, clonedConfig);
+  await runSequelizeHook(anySequelize, "afterConnect", connection, clonedConfig);
   return connection;
 }
 
 async function disconnect(sequelize: SequelizeLike, connection: unknown): Promise<unknown> {
-  const manager = sequelize.connectionManager as
+  const manager = safeConnectionManager(sequelize) as
     | {
         _disconnect?: (connection: unknown) => Promise<unknown>;
       }
@@ -338,31 +346,62 @@ async function disconnect(sequelize: SequelizeLike, connection: unknown): Promis
   }
 
   const anySequelize = sequelize as Record<string, any>;
-  await anySequelize.hooks?.runAsync?.("beforeDisconnect", connection);
-  await anySequelize.runHooks?.("beforeDisconnect", connection);
+  await runSequelizeHook(anySequelize, "beforeDisconnect", connection);
   const result = await anySequelize.dialect?.connectionManager?.disconnect?.(connection);
-  await anySequelize.hooks?.runAsync?.("afterDisconnect", connection);
-  await anySequelize.runHooks?.("afterDisconnect", connection);
+  await runSequelizeHook(anySequelize, "afterDisconnect", connection);
   return result;
 }
 
 function validate(sequelize: SequelizeLike, connection: unknown): boolean {
   const anySequelize = sequelize as Record<string, any>;
   const validator =
-    anySequelize.connectionManager?.dialect?.connectionManager?.validate ??
+    safeConnectionManager(sequelize)?.dialect?.connectionManager?.validate ??
     anySequelize.dialect?.connectionManager?.validate;
 
   return validator ? Boolean(validator(connection)) : true;
 }
 
-function configWithoutReplication(config: Record<string, unknown>): Record<string, unknown> {
+function configWithoutReplication(config: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (!config) {
+    return {};
+  }
+
   const { replication: _replication, pool: _pool, ...rest } = config;
   return rest;
 }
 
-function objectAt(value: unknown, key?: string): Record<string, any> {
-  if ((typeof value !== "object" && typeof value !== "function") || value === null) {
+function connectionOptionsFrom(config: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (!config) {
     return {};
+  }
+
+  const allowedKeys = [
+    "database",
+    "username",
+    "user",
+    "password",
+    "host",
+    "port",
+    "dialect",
+    "ssl",
+    "dialectModule",
+    "pgModule",
+    "mysql2Module",
+  ];
+  const result: Record<string, unknown> = {};
+
+  for (const key of allowedKeys) {
+    if (key in config) {
+      result[key] = config[key];
+    }
+  }
+
+  return result;
+}
+
+function objectAt(value: unknown, key?: string): Record<string, any> | undefined {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) {
+    return undefined;
   }
 
   if (!key) {
@@ -372,7 +411,7 @@ function objectAt(value: unknown, key?: string): Record<string, any> {
   const child = (value as Record<string, unknown>)[key];
 
   if ((typeof child !== "object" && typeof child !== "function") || child === null) {
-    return {};
+    return undefined;
   }
 
   return child as Record<string, any>;
@@ -399,4 +438,29 @@ function numericProperty(target: unknown, property: string): number {
 
   const value = (target as Record<string, unknown>)[property];
   return typeof value === "number" ? value : 0;
+}
+
+async function runSequelizeHook(sequelize: Record<string, any>, name: string, ...args: unknown[]): Promise<void> {
+  if (sequelize.hooks?.runAsync) {
+    await sequelize.hooks.runAsync(name, ...args);
+    return;
+  }
+
+  await sequelize.runHooks?.(name, ...args);
+}
+
+function safeConnectionManager(sequelize: SequelizeLike): any {
+  return safeGet(sequelize, "connectionManager");
+}
+
+function safeGet<T extends object, K extends PropertyKey>(target: T | undefined, key: K): any {
+  if (!target) {
+    return undefined;
+  }
+
+  try {
+    return (target as Record<K, unknown>)[key];
+  } catch {
+    return undefined;
+  }
 }

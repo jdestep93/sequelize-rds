@@ -1,0 +1,112 @@
+name: Publish npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      npm-tag:
+        description: "npm dist-tag to publish with. Leave blank to infer from package version."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      - name: Build
+        run: npm run build
+
+      - name: Integration tests
+        run: npm run test:integration
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: validate
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Resolve npm metadata
+        id: npm
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_name="$(node -p "require('./package.json').name")"
+          package_version="$(node -p "require('./package.json').version")"
+          requested_tag="${{ inputs.npm-tag }}"
+
+          if [[ -n "$requested_tag" ]]; then
+            npm_tag="$requested_tag"
+          elif [[ "$package_version" == *"-alpha"* ]]; then
+            npm_tag="alpha"
+          elif [[ "$package_version" == *"-beta"* ]]; then
+            npm_tag="beta"
+          elif [[ "$package_version" == *"-rc"* ]]; then
+            npm_tag="next"
+          else
+            npm_tag="latest"
+          fi
+
+          echo "package_name=$package_name" >> "$GITHUB_OUTPUT"
+          echo "package_version=$package_version" >> "$GITHUB_OUTPUT"
+          echo "npm_tag=$npm_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Guard against republishing an existing version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package="${{ steps.npm.outputs.package_name }}@${{ steps.npm.outputs.package_version }}"
+
+          if npm view "$package" version >/dev/null 2>&1; then
+            echo "$package already exists on npm. Bump package.json before publishing."
+            exit 1
+          fi
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --tag "${{ steps.npm.outputs.npm_tag }}" --provenance
