@@ -105,6 +105,67 @@ The balancer polls AWS RDS with `DescribeDBClusters` and `DescribeDBInstances`.
 
 Default polling interval is `30_000` ms. Override it with `pollIntervalMs`.
 
+## Read-after-write consistency
+
+By default, `sequelize-rds` keeps Sequelize's normal read/write routing behavior. If your app needs read-after-write
+consistency for request flows that write data and then immediately read it back, wrap the request in a consistency context
+and explicitly pin reads to the writer after the write:
+
+```ts
+app.post("/users", async (req, res) => {
+  await balancer.runWithReadConsistency(async () => {
+    await User.create(req.body);
+    balancer.pinReadsToWriter({ ttlMs: 5_000, reason: "created-user" });
+
+    const user = await User.findOne({ where: { email: req.body.email } });
+    res.json(user);
+  });
+});
+```
+
+`pinReadsToWriter()` must be called inside `runWithReadConsistency()`. Pins are scoped to the current async context and
+do not affect other requests. The default pin TTL is `5_000` ms and can be changed globally:
+
+```ts
+attachRdsReplicaBalancer(sequelize, {
+  clusterIdentifier: "app-cluster",
+  region: "us-east-1",
+  readConsistency: {
+    defaultPinToWriterMs: 2_000,
+  },
+});
+```
+
+This package does not automatically detect writes or patch Sequelize model/query methods. Call `pinReadsToWriter()` at the
+point where your application knows subsequent reads require writer consistency.
+
+## Replica lag filtering
+
+You can provide a lag probe to exclude stale readers from scheduling:
+
+```ts
+attachRdsReplicaBalancer(sequelize, {
+  clusterIdentifier: "app-cluster",
+  region: "us-east-1",
+  readerLag: {
+    maxLagMs: 250,
+    probeTimeoutMs: 2_000,
+    async probe({ reader, connection }) {
+      const lagMs = await measureLagForReader(reader, connection);
+      return lagMs;
+    },
+  },
+});
+```
+
+Readers with lag above `maxLagMs` are removed from read scheduling until a later probe reports acceptable lag. Readers with
+unknown lag remain schedulable in this first version. If every reader is stale, reads fall back to the writer when
+`fallbackToWriter` is enabled; otherwise `NoActiveReadersError` is thrown.
+
+Lag SQL differs by engine, Aurora mode, permissions, and replication setup, so v1 uses a user-provided probe instead of
+built-in Postgres/MySQL/Aurora queries. By default, probes refresh on the topology polling interval. Use
+`balancer.getReaderStates()` to inspect current reader lag and health state.
+
 ## AWS credentials
 
 By default, the package uses the standard AWS SDK credential chain. This supports `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_PROFILE`, and role credentials from Lambda, ECS, EKS, or EC2.
@@ -199,6 +260,19 @@ interface RdsReplicaBalancerOptions {
   autoStart?: boolean;
   logger?: RdsReplicaBalancerLogger;
   onTopologyChange?: (topology: RdsClusterTopology) => void | Promise<void>;
+  readConsistency?: {
+    defaultPinToWriterMs?: number;
+  };
+  readerLag?: {
+    maxLagMs: number;
+    refreshIntervalMs?: number;
+    probeTimeoutMs?: number;
+    probe(input: {
+      reader: RdsReaderEndpoint;
+      connection: unknown;
+      topology: RdsClusterTopology;
+    }): Promise<number | null | undefined>;
+  };
 }
 ```
 
@@ -221,6 +295,10 @@ await balancer.syncNow();
 balancer.start();
 balancer.stop();
 const topology = balancer.getTopology();
+await balancer.runWithReadConsistency(async () => {
+  balancer.pinReadsToWriter({ ttlMs: 5000 });
+});
+const readerStates = balancer.getReaderStates();
 await balancer.destroy();
 ```
 

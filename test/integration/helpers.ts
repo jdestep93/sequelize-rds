@@ -135,6 +135,62 @@ export function runSequelizeIntegrationSuite(options: IntegrationSuiteOptions): 
       }
     });
 
+    it("routes reads to the writer while explicitly pinned in a consistency context", async () => {
+      const { sequelize, queryTypes, close } = options.createSequelize(stack.context);
+      const rdsClient = createMutableRdsClient(stack.context);
+      rdsClient.setReaders([stack.context.reader1]);
+      const balancer = attachRdsReplicaBalancer(sequelize, {
+        clusterIdentifier: "app-cluster",
+        region: "us-east-1",
+        rdsClient,
+        fallbackToWriter: false,
+        keepExistingWriteHost: true,
+      });
+
+      try {
+        await balancer.syncNow();
+        await balancer.runWithReadConsistency(async () => {
+          balancer.pinReadsToWriter({ ttlMs: 1_000, reason: "after-write" });
+          await expect(readMarker(sequelize, queryTypes)).resolves.toBe("writer");
+        });
+        await expect(readMarker(sequelize, queryTypes)).resolves.toBe("reader-1");
+      } finally {
+        await balancer.destroy();
+        await close();
+      }
+    });
+
+    it("excludes stale readers using a user-provided lag probe", async () => {
+      const { sequelize, queryTypes, close } = options.createSequelize(stack.context);
+      const rdsClient = createMutableRdsClient(stack.context);
+      rdsClient.setReaders([stack.context.reader1, stack.context.reader2]);
+      const balancer = attachRdsReplicaBalancer(sequelize, {
+        clusterIdentifier: "app-cluster",
+        region: "us-east-1",
+        rdsClient,
+        fallbackToWriter: false,
+        keepExistingWriteHost: true,
+        readerLag: {
+          maxLagMs: 100,
+          probe: async ({ reader }) => (reader.instanceIdentifier === stack.context.reader1.id ? 1_000 : 10),
+        },
+      });
+
+      try {
+        await balancer.syncNow();
+        await expect(readMarker(sequelize, queryTypes)).resolves.toBe("reader-2");
+        expect(balancer.getReaderStates()).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ reader: expect.objectContaining({ instanceIdentifier: "reader-1" }), status: "stale" }),
+            expect.objectContaining({ reader: expect.objectContaining({ instanceIdentifier: "reader-2" }), status: "healthy" }),
+          ]),
+        );
+      } finally {
+        await balancer.destroy();
+        await close();
+      }
+    });
+
     it("throws NoActiveReadersError when fallback is disabled and no readers are active", async () => {
       const { sequelize, queryTypes, close } = options.createSequelize(stack.context);
       const rdsClient = createMutableRdsClient(stack.context);

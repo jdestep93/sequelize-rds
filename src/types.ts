@@ -28,6 +28,23 @@ export interface RdsReplicaBalancerOptions {
   autoStart?: boolean;
   logger?: RdsReplicaBalancerLogger;
   onTopologyChange?: (topology: RdsClusterTopology) => void | Promise<void>;
+  readConsistency?: RdsReadConsistencyOptions;
+  readerLag?: RdsReaderLagOptions;
+}
+
+export interface RdsReadConsistencyOptions {
+  defaultPinToWriterMs?: number;
+}
+
+export interface RdsReaderLagOptions {
+  maxLagMs: number;
+  refreshIntervalMs?: number;
+  probeTimeoutMs?: number;
+  probe(input: {
+    reader: RdsReaderEndpoint;
+    connection: unknown;
+    topology: RdsClusterTopology;
+  }): Promise<number | null | undefined>;
 }
 
 export interface RdsEndpoint {
@@ -57,11 +74,23 @@ export interface RdsClusterTopology {
   unavailableReaders: RdsUnavailableReader[];
 }
 
+export interface RdsReaderState {
+  reader: RdsReaderEndpoint;
+  status: "healthy" | "stale" | "unknown";
+  lagMs?: number;
+  lastProbeAt?: Date;
+  staleReason?: "lag-threshold";
+}
+
 export interface RdsReplicaBalancer {
   start(): void;
   stop(): void;
   syncNow(): Promise<RdsClusterTopology>;
   getTopology(): RdsClusterTopology | undefined;
+  runWithReadConsistency<T>(fn: () => T | Promise<T>): T | Promise<T>;
+  pinReadsToWriter(options?: { ttlMs?: number; reason?: string }): void;
+  isPinnedToWriter(): boolean;
+  getReaderStates(): RdsReaderState[];
   destroy(): Promise<void>;
 }
 
