@@ -3,7 +3,7 @@ import { Pool, TimeoutError } from "sequelize-pool";
 import { NoActiveReadersError } from "./errors.js";
 import { Semaphore } from "./semaphore.js";
 import { FALLBACK_WRITE_CONNECTION, READER_POOL_KEY, READ_SLOT_HELD } from "./symbols.js";
-import type { RdsReaderEndpoint, RdsReplicaBalancerLogger } from "./types.js";
+import type { RdsReaderEndpoint, RdsReaderState, RdsReplicaBalancerLogger } from "./types.js";
 
 export type QueryType = "read" | "write" | "SELECT" | string | undefined;
 
@@ -38,6 +38,7 @@ interface ReaderPoolEntry {
   key: string;
   endpoint: RdsReaderEndpoint;
   config: Record<string, unknown>;
+  readerState: RdsReaderState;
   pool: Pool<unknown>;
   state: "active" | "draining";
 }
@@ -70,7 +71,7 @@ export class DynamicReadPool {
     this.#readSlots = new Semaphore(Math.max(1, options.poolOptions.max));
   }
 
-  updateReaders(readers: Array<{ endpoint: RdsReaderEndpoint; config: Record<string, unknown> }>): void {
+  updateReaders(readers: Array<{ endpoint: RdsReaderEndpoint; config: Record<string, unknown>; state?: RdsReaderState }>): void {
     const nextKeys = new Set<string>();
 
     for (const reader of readers) {
@@ -81,6 +82,7 @@ export class DynamicReadPool {
       if (existing?.state === "active") {
         existing.endpoint = reader.endpoint;
         existing.config = reader.config;
+        existing.readerState = reader.state ?? unknownReaderState(reader.endpoint);
         continue;
       }
 
@@ -88,6 +90,7 @@ export class DynamicReadPool {
         key,
         endpoint: reader.endpoint,
         config: reader.config,
+        readerState: reader.state ?? unknownReaderState(reader.endpoint),
         state: "active",
         pool: this.#createPool(key, reader.config),
       });
@@ -104,16 +107,21 @@ export class DynamicReadPool {
       }
     }
 
-    this.#schedule = [...nextKeys].filter((key) => this.#readers.get(key)?.state === "active");
+    this.#schedule = [...nextKeys].filter((key) => {
+      const entry = this.#readers.get(key);
+      return entry?.state === "active" && entry.readerState.status !== "stale";
+    });
     this.#cursor %= Math.max(1, this.#schedule.length);
   }
 
-  async acquireRead(): Promise<unknown> {
+  async acquireRead(options: { forceWriter?: boolean } = {}): Promise<unknown> {
+    if (options.forceWriter) {
+      return this.#acquireWriteFallback();
+    }
+
     if (this.#schedule.length === 0) {
       if (this.#fallbackToWriter) {
-        const connection = await this.#writePool.acquire("SELECT", true);
-        tagConnection(connection, FALLBACK_WRITE_CONNECTION, true);
-        return connection;
+        return this.#acquireWriteFallback();
       }
 
       throw new NoActiveReadersError(this.#clusterIdentifier);
@@ -218,6 +226,18 @@ export class DynamicReadPool {
     return this.#schedule.length;
   }
 
+  getReaderStates(): RdsReaderState[] {
+    return [...this.#readers.values()]
+      .filter((entry) => entry.state === "active")
+      .map((entry) => ({ ...entry.readerState }));
+  }
+
+  async #acquireWriteFallback(): Promise<unknown> {
+    const connection = await this.#writePool.acquire("SELECT", true);
+    tagConnection(connection, FALLBACK_WRITE_CONNECTION, true);
+    return connection;
+  }
+
   #nextReader(): ReaderPoolEntry {
     for (let attempts = 0; attempts < this.#schedule.length; attempts += 1) {
       const key = this.#schedule[this.#cursor % this.#schedule.length];
@@ -274,6 +294,13 @@ export class DynamicReadPool {
 
 export function readerKey(endpoint: RdsReaderEndpoint): string {
   return `${endpoint.instanceIdentifier}:${endpoint.host}:${endpoint.port}`;
+}
+
+function unknownReaderState(reader: RdsReaderEndpoint): RdsReaderState {
+  return {
+    reader,
+    status: "unknown",
+  };
 }
 
 async function drainAndDestroy(

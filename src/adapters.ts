@@ -1,24 +1,31 @@
-import { DynamicReadPool, type PoolDelegate } from "./dynamic-read-pool.js";
+import { DynamicReadPool, readerKey, type PoolDelegate } from "./dynamic-read-pool.js";
 import { RdsReplicaBalancerError } from "./errors.js";
 import type {
   RdsClusterTopology,
   RdsReaderEndpoint,
+  RdsReaderState,
   RdsReplicaBalancerLogger,
   RdsReplicaBalancerOptions,
   SequelizeLike,
 } from "./types.js";
 
 export interface SequelizePoolAdapter {
-  applyTopology(topology: RdsClusterTopology): void;
+  applyTopology(topology: RdsClusterTopology): Promise<void>;
+  getReaderStates(): RdsReaderState[];
   destroy(): Promise<void>;
 }
 
 interface AdapterContext {
   sequelize: SequelizeLike;
   options: Required<
-    Pick<RdsReplicaBalancerOptions, "clusterIdentifier" | "drainTimeoutMs" | "fallbackToWriter" | "keepExistingWriteHost">
+    Pick<
+      RdsReplicaBalancerOptions,
+      "clusterIdentifier" | "drainTimeoutMs" | "fallbackToWriter" | "keepExistingWriteHost" | "pollIntervalMs"
+    >
   > &
-    Pick<RdsReplicaBalancerOptions, "logger">;
+    Pick<RdsReplicaBalancerOptions, "logger" | "readerLag"> & {
+      isPinnedToWriter?: () => boolean;
+    };
 }
 
 export function installSequelizePoolAdapter(sequelize: SequelizeLike, options: AdapterContext["options"]): SequelizePoolAdapter {
@@ -42,13 +49,16 @@ function installV6Adapter(context: AdapterContext): SequelizePoolAdapter {
 
   const originalPool = connectionManager.pool as PoolDelegate & Record<string, unknown>;
   const dynamicReads = createDynamicReadPool(context, originalPool);
-  const facade = new V6PoolFacade(originalPool, dynamicReads);
+  const facade = new V6PoolFacade(originalPool, dynamicReads, context.options.isPinnedToWriter ?? (() => false));
   connectionManager.pool = facade;
 
   return {
-    applyTopology(topology) {
+    async applyTopology(topology) {
       updateWriteHost(context.sequelize, topology, context.options);
-      dynamicReads.updateReaders(readersToConfigs(context.sequelize, topology.readers));
+      dynamicReads.updateReaders(await readersToConfigs(context, topology, dynamicReads));
+    },
+    getReaderStates() {
+      return dynamicReads.getReaderStates();
     },
     async destroy() {
       connectionManager.pool = originalPool;
@@ -66,13 +76,16 @@ function installV7Adapter(context: AdapterContext): SequelizePoolAdapter {
 
   const poolDelegate = originalPool as PoolDelegate & Record<string, unknown>;
   const dynamicReads = createDynamicReadPool(context, createV7WriteFallbackDelegate(poolDelegate));
-  const facade = new V7PoolFacade(poolDelegate, dynamicReads);
+  const facade = new V7PoolFacade(poolDelegate, dynamicReads, context.options.isPinnedToWriter ?? (() => false));
   context.sequelize.pool = facade;
 
   return {
-    applyTopology(topology) {
+    async applyTopology(topology) {
       updateWriteHost(context.sequelize, topology, context.options);
-      dynamicReads.updateReaders(readersToConfigs(context.sequelize, topology.readers));
+      dynamicReads.updateReaders(await readersToConfigs(context, topology, dynamicReads));
+    },
+    getReaderStates() {
+      return dynamicReads.getReaderStates();
     },
     async destroy() {
       context.sequelize.pool = originalPool;
@@ -88,6 +101,7 @@ class V6PoolFacade implements PoolDelegate {
   constructor(
     private readonly originalPool: PoolDelegate & Record<string, unknown>,
     private readonly dynamicReads: DynamicReadPool,
+    private readonly isPinnedToWriter: () => boolean,
   ) {
     this.read = dynamicReads;
     this.write = originalPool.write ?? originalPool;
@@ -95,7 +109,7 @@ class V6PoolFacade implements PoolDelegate {
 
   acquire(queryType?: unknown, useMaster?: unknown): Promise<unknown> {
     if (queryType === "SELECT" && !useMaster) {
-      return this.dynamicReads.acquireRead();
+      return this.dynamicReads.acquireRead({ forceWriter: this.isPinnedToWriter() });
     }
 
     return this.originalPool.acquire(queryType, useMaster);
@@ -145,6 +159,7 @@ class V7PoolFacade implements PoolDelegate {
   constructor(
     private readonly originalPool: PoolDelegate & Record<string, unknown>,
     private readonly dynamicReads: DynamicReadPool,
+    private readonly isPinnedToWriter: () => boolean,
   ) {
     this.read = dynamicReads;
     this.write = getOriginalPool(originalPool, "write");
@@ -152,7 +167,7 @@ class V7PoolFacade implements PoolDelegate {
 
   acquire(options?: { type?: string; useMaster?: boolean } | undefined): Promise<unknown> {
     if (options?.type === "read" && !options.useMaster) {
-      return this.dynamicReads.acquireRead();
+      return this.dynamicReads.acquireRead({ forceWriter: this.isPinnedToWriter() });
     }
 
     return this.originalPool.acquire(options);
@@ -229,18 +244,109 @@ function createV7WriteFallbackDelegate(originalPool: PoolDelegate & Record<strin
   };
 }
 
-function readersToConfigs(
-  sequelize: SequelizeLike,
-  readers: RdsReaderEndpoint[],
-): Array<{ endpoint: RdsReaderEndpoint; config: Record<string, unknown> }> {
-  return readers.map((endpoint) => ({
+async function readersToConfigs(
+  context: AdapterContext,
+  topology: RdsClusterTopology,
+  dynamicReads: DynamicReadPool,
+): Promise<Array<{ endpoint: RdsReaderEndpoint; config: Record<string, unknown>; state?: RdsReaderState }>> {
+  const readers = topology.readers.map((endpoint) => ({
     endpoint,
     config: {
-      ...getBaseReadConfig(sequelize),
+      ...getBaseReadConfig(context.sequelize),
       host: endpoint.host,
       port: endpoint.port,
     },
   }));
+
+  if (!context.options.readerLag) {
+    return readers;
+  }
+
+  const previousStates = new Map(dynamicReads.getReaderStates().map((state) => [readerKey(state.reader), state]));
+  const refreshIntervalMs = context.options.readerLag.refreshIntervalMs ?? context.options.pollIntervalMs;
+  const now = Date.now();
+
+  return Promise.all(
+    readers.map(async (reader) => {
+      const previous = previousStates.get(readerKey(reader.endpoint));
+
+      if (previous?.lastProbeAt && now - previous.lastProbeAt.getTime() < refreshIntervalMs) {
+        return { ...reader, state: previous };
+      }
+
+      const state = await probeReaderLag(context, topology, reader.endpoint, reader.config, previous);
+      return { ...reader, state };
+    }),
+  );
+}
+
+async function probeReaderLag(
+  context: AdapterContext,
+  topology: RdsClusterTopology,
+  reader: RdsReaderEndpoint,
+  config: Record<string, unknown>,
+  previous: RdsReaderState | undefined,
+): Promise<RdsReaderState> {
+  const lagOptions = context.options.readerLag;
+
+  if (!lagOptions) {
+    return { reader, status: "unknown" };
+  }
+
+  let connection: unknown;
+
+  try {
+    connection = await connect(context.sequelize, config);
+    const lagMs = await withTimeout(
+      lagOptions.probe({ reader, connection, topology }),
+      lagOptions.probeTimeoutMs ?? 5_000,
+    );
+
+    if (lagMs === null || lagMs === undefined) {
+      return { reader, status: "unknown", lastProbeAt: new Date() };
+    }
+
+    if (lagMs > lagOptions.maxLagMs) {
+      return {
+        reader,
+        status: "stale",
+        lagMs,
+        lastProbeAt: new Date(),
+        staleReason: "lag-threshold",
+      };
+    }
+
+    return { reader, status: "healthy", lagMs, lastProbeAt: new Date() };
+  } catch (error) {
+    context.options.logger?.warn?.("RDS reader lag probe failed.", {
+      instanceIdentifier: reader.instanceIdentifier,
+      error,
+    });
+    return previous ?? { reader, status: "unknown" };
+  } finally {
+    if (connection) {
+      await disconnect(context.sequelize, connection);
+    }
+  }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          reject(new Error(`RDS reader lag probe timed out after ${timeoutMs} ms.`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 function getPoolOptions(sequelize: SequelizeLike): {

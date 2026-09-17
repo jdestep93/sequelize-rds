@@ -18,3 +18,10 @@ export class RdsTopologyError extends RdsReplicaBalancerError {
     this.name = "RdsTopologyError";
   }
 }
+
+export class ReadConsistencyContextError extends RdsReplicaBalancerError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ReadConsistencyContextError";
+  }
+}

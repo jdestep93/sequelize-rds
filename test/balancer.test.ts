@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { NoActiveReadersError, attachRdsReplicaBalancer, createRdsAwareSequelize } from "../src/index.js";
+import {
+  NoActiveReadersError,
+  ReadConsistencyContextError,
+  attachRdsReplicaBalancer,
+  createRdsAwareSequelize,
+} from "../src/index.js";
 import {
   cluster,
   createFakeV6Sequelize,
@@ -165,6 +170,157 @@ describe("RdsReplicaBalancerController", () => {
     await balancer.destroy();
   });
 
+  it("routes v6 reads to the writer while pinned in a consistency context", async () => {
+    const { sequelize, writePool } = createFakeV6Sequelize();
+    const balancer = attachRdsReplicaBalancer(sequelize, {
+      clusterIdentifier: "app-cluster",
+      region: "us-east-1",
+      rdsClient: createRdsClientSequence([
+        {
+          cluster: cluster([
+            { DBInstanceIdentifier: "writer-1", IsClusterWriter: true },
+            { DBInstanceIdentifier: "reader-1", IsClusterWriter: false },
+          ]),
+          instances: [instance("writer-1"), instance("reader-1")],
+        },
+      ]),
+      fallbackToWriter: false,
+    });
+
+    await balancer.syncNow();
+    await balancer.runWithReadConsistency(async () => {
+      balancer.pinReadsToWriter({ ttlMs: 1_000, reason: "after-write" });
+      const connection = await sequelize.connectionManager.pool.acquire("SELECT", false);
+
+      expect(connection).toMatchObject({ kind: "write" });
+      sequelize.connectionManager.pool.release(connection);
+    });
+
+    expect(writePool.acquired).toHaveLength(1);
+    expect(writePool.released).toHaveLength(1);
+
+    const readerConnection = await sequelize.connectionManager.pool.acquire("SELECT", false);
+    expect(readerConnection).toMatchObject({ host: "reader-1.local" });
+    sequelize.connectionManager.pool.release(readerConnection);
+    await balancer.destroy();
+  });
+
+  it("routes v7 reads to the writer while pinned in a consistency context", async () => {
+    const { sequelize } = createFakeV7Sequelize();
+    const balancer = attachRdsReplicaBalancer(sequelize, {
+      clusterIdentifier: "app-cluster",
+      region: "us-east-1",
+      rdsClient: createRdsClientSequence([
+        {
+          cluster: cluster([
+            { DBInstanceIdentifier: "writer-1", IsClusterWriter: true },
+            { DBInstanceIdentifier: "reader-1", IsClusterWriter: false },
+          ]),
+          instances: [instance("writer-1"), instance("reader-1")],
+        },
+      ]),
+      fallbackToWriter: false,
+    });
+
+    await balancer.syncNow();
+    await balancer.runWithReadConsistency(async () => {
+      balancer.pinReadsToWriter({ ttlMs: 1_000 });
+      const connection = await sequelize.pool.acquire({ type: "read" });
+
+      expect(connection).toMatchObject({ kind: "write" });
+      sequelize.pool.release(connection);
+    });
+
+    await balancer.destroy();
+  });
+
+  it("expires read consistency pins after their ttl", async () => {
+    const { sequelize } = createFakeV6Sequelize();
+    const balancer = attachRdsReplicaBalancer(sequelize, {
+      clusterIdentifier: "app-cluster",
+      region: "us-east-1",
+      rdsClient: createRdsClientSequence([
+        {
+          cluster: cluster([
+            { DBInstanceIdentifier: "writer-1", IsClusterWriter: true },
+            { DBInstanceIdentifier: "reader-1", IsClusterWriter: false },
+          ]),
+          instances: [instance("writer-1"), instance("reader-1")],
+        },
+      ]),
+      fallbackToWriter: false,
+    });
+
+    await balancer.syncNow();
+    await balancer.runWithReadConsistency(async () => {
+      balancer.pinReadsToWriter({ ttlMs: 1 });
+      expect(balancer.isPinnedToWriter()).toBe(true);
+      await sleep(5);
+      expect(balancer.isPinnedToWriter()).toBe(false);
+
+      const connection = await sequelize.connectionManager.pool.acquire("SELECT", false);
+      expect(connection).toMatchObject({ host: "reader-1.local" });
+      sequelize.connectionManager.pool.release(connection);
+    });
+
+    await balancer.destroy();
+  });
+
+  it("does not leak read consistency pins across async contexts", async () => {
+    const { sequelize } = createFakeV6Sequelize();
+    const balancer = attachRdsReplicaBalancer(sequelize, {
+      clusterIdentifier: "app-cluster",
+      region: "us-east-1",
+      rdsClient: createRdsClientSequence([
+        {
+          cluster: cluster([
+            { DBInstanceIdentifier: "writer-1", IsClusterWriter: true },
+            { DBInstanceIdentifier: "reader-1", IsClusterWriter: false },
+          ]),
+          instances: [instance("writer-1"), instance("reader-1")],
+        },
+      ]),
+    });
+    let releasePinned!: () => void;
+    const pinnedGate = new Promise<void>((resolve) => {
+      releasePinned = resolve;
+    });
+
+    await balancer.syncNow();
+    await Promise.all([
+      balancer.runWithReadConsistency(async () => {
+        balancer.pinReadsToWriter({ ttlMs: 1_000 });
+        expect(balancer.isPinnedToWriter()).toBe(true);
+        await pinnedGate;
+      }),
+      balancer.runWithReadConsistency(async () => {
+        await sleep(1);
+        expect(balancer.isPinnedToWriter()).toBe(false);
+        releasePinned();
+      }),
+    ]);
+
+    expect(balancer.isPinnedToWriter()).toBe(false);
+    await balancer.destroy();
+  });
+
+  it("throws when pinning reads outside a consistency context", async () => {
+    const { sequelize } = createFakeV6Sequelize();
+    const balancer = attachRdsReplicaBalancer(sequelize, {
+      clusterIdentifier: "app-cluster",
+      region: "us-east-1",
+      rdsClient: createRdsClientSequence([
+        {
+          cluster: cluster([{ DBInstanceIdentifier: "writer-1", IsClusterWriter: true }]),
+          instances: [instance("writer-1")],
+        },
+      ]),
+    });
+
+    expect(() => balancer.pinReadsToWriter()).toThrow(ReadConsistencyContextError);
+    await balancer.destroy();
+  });
+
   it("round-robins reads across active readers when pool capacity allows it", async () => {
     const { sequelize } = createFakeV6Sequelize();
     sequelize.connectionManager.config.pool.max = 2;
@@ -192,6 +348,124 @@ describe("RdsReplicaBalancerController", () => {
 
     sequelize.connectionManager.pool.release(first);
     sequelize.connectionManager.pool.release(second);
+    await balancer.destroy();
+  });
+
+  it("excludes readers whose lag probe exceeds the configured threshold", async () => {
+    const { sequelize } = createFakeV6Sequelize();
+    sequelize.connectionManager.config.pool.max = 2;
+    const balancer = attachRdsReplicaBalancer(sequelize, {
+      clusterIdentifier: "app-cluster",
+      region: "us-east-1",
+      rdsClient: createRdsClientSequence([
+        {
+          cluster: cluster([
+            { DBInstanceIdentifier: "writer-1", IsClusterWriter: true },
+            { DBInstanceIdentifier: "reader-1", IsClusterWriter: false },
+            { DBInstanceIdentifier: "reader-2", IsClusterWriter: false },
+          ]),
+          instances: [instance("writer-1"), instance("reader-1"), instance("reader-2")],
+        },
+      ]),
+      fallbackToWriter: false,
+      readerLag: {
+        maxLagMs: 100,
+        probe: async ({ reader }) => (reader.instanceIdentifier === "reader-1" ? 1_000 : 10),
+      },
+    });
+
+    await balancer.syncNow();
+    const connection = await sequelize.connectionManager.pool.acquire("SELECT", false);
+
+    expect(connection).toMatchObject({ host: "reader-2.local" });
+    expect(balancer.getReaderStates()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ reader: expect.objectContaining({ instanceIdentifier: "reader-1" }), status: "stale" }),
+        expect.objectContaining({ reader: expect.objectContaining({ instanceIdentifier: "reader-2" }), status: "healthy" }),
+      ]),
+    );
+
+    sequelize.connectionManager.pool.release(connection);
+    await balancer.destroy();
+  });
+
+  it("falls back to the writer when every reader is stale and fallback is enabled", async () => {
+    const { sequelize } = createFakeV6Sequelize();
+    const balancer = attachRdsReplicaBalancer(sequelize, {
+      clusterIdentifier: "app-cluster",
+      region: "us-east-1",
+      rdsClient: createRdsClientSequence([
+        {
+          cluster: cluster([
+            { DBInstanceIdentifier: "writer-1", IsClusterWriter: true },
+            { DBInstanceIdentifier: "reader-1", IsClusterWriter: false },
+          ]),
+          instances: [instance("writer-1"), instance("reader-1")],
+        },
+      ]),
+      fallbackToWriter: true,
+      readerLag: {
+        maxLagMs: 100,
+        probe: async () => 1_000,
+      },
+    });
+
+    await balancer.syncNow();
+    const connection = await sequelize.connectionManager.pool.acquire("SELECT", false);
+
+    expect(connection).toMatchObject({ kind: "write" });
+    sequelize.connectionManager.pool.release(connection);
+    await balancer.destroy();
+  });
+
+  it("keeps the previous reader state when a lag probe fails", async () => {
+    const { sequelize } = createFakeV6Sequelize();
+    const logger = { warn: vi.fn() };
+    let probeCalls = 0;
+    const balancer = attachRdsReplicaBalancer(sequelize, {
+      clusterIdentifier: "app-cluster",
+      region: "us-east-1",
+      rdsClient: createRdsClientSequence([
+        {
+          cluster: cluster([
+            { DBInstanceIdentifier: "writer-1", IsClusterWriter: true },
+            { DBInstanceIdentifier: "reader-1", IsClusterWriter: false },
+          ]),
+          instances: [instance("writer-1"), instance("reader-1")],
+        },
+        {
+          cluster: cluster([
+            { DBInstanceIdentifier: "writer-1", IsClusterWriter: true },
+            { DBInstanceIdentifier: "reader-1", IsClusterWriter: false },
+          ]),
+          instances: [instance("writer-1"), instance("reader-1")],
+        },
+      ]),
+      fallbackToWriter: false,
+      logger,
+      readerLag: {
+        maxLagMs: 100,
+        refreshIntervalMs: 0,
+        probe: async () => {
+          probeCalls += 1;
+          if (probeCalls > 1) {
+            throw new Error("probe failed");
+          }
+
+          return 10;
+        },
+      },
+    });
+
+    await balancer.syncNow();
+    await balancer.syncNow();
+    const connection = await sequelize.connectionManager.pool.acquire("SELECT", false);
+
+    expect(connection).toMatchObject({ host: "reader-1.local" });
+    expect(balancer.getReaderStates()[0]).toMatchObject({ status: "healthy", lagMs: 10 });
+    expect(logger.warn).toHaveBeenCalledWith("RDS reader lag probe failed.", expect.any(Object));
+
+    sequelize.connectionManager.pool.release(connection);
     await balancer.destroy();
   });
 

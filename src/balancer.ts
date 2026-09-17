@@ -1,7 +1,14 @@
 import { installSequelizePoolAdapter, type SequelizePoolAdapter } from "./adapters.js";
+import {
+  DEFAULT_PIN_TO_WRITER_MS,
+  isPinnedToWriter,
+  pinReadsToWriter,
+  runWithReadConsistency,
+} from "./consistency.js";
 import { discoverRdsTopology, topologySignature } from "./topology.js";
 import type {
   RdsClusterTopology,
+  RdsReaderState,
   RdsReplicaBalancer,
   RdsReplicaBalancerOptions,
   SequelizeLike,
@@ -14,6 +21,7 @@ export class RdsReplicaBalancerController implements RdsReplicaBalancer {
   readonly #sequelize: SequelizeLike;
   readonly #options: RdsReplicaBalancerOptions;
   readonly #adapter: SequelizePoolAdapter;
+  readonly #consistencyToken = {};
   #topology?: RdsClusterTopology;
   #signature?: string;
   #interval?: ReturnType<typeof setInterval>;
@@ -27,7 +35,10 @@ export class RdsReplicaBalancerController implements RdsReplicaBalancer {
       drainTimeoutMs: this.#options.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS,
       fallbackToWriter: this.#options.fallbackToWriter ?? true,
       keepExistingWriteHost: this.#options.keepExistingWriteHost ?? false,
+      pollIntervalMs: this.#options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
       logger: this.#options.logger,
+      readerLag: this.#options.readerLag,
+      isPinnedToWriter: () => this.isPinnedToWriter(),
     });
 
     if (this.#options.autoStart) {
@@ -72,6 +83,26 @@ export class RdsReplicaBalancerController implements RdsReplicaBalancer {
     return this.#topology;
   }
 
+  runWithReadConsistency<T>(fn: () => T | Promise<T>): T | Promise<T> {
+    return runWithReadConsistency(fn);
+  }
+
+  pinReadsToWriter(options?: { ttlMs?: number; reason?: string }): void {
+    pinReadsToWriter(
+      this.#consistencyToken,
+      options,
+      this.#options.readConsistency?.defaultPinToWriterMs ?? DEFAULT_PIN_TO_WRITER_MS,
+    );
+  }
+
+  isPinnedToWriter(): boolean {
+    return isPinnedToWriter(this.#consistencyToken);
+  }
+
+  getReaderStates(): RdsReaderState[] {
+    return this.#adapter.getReaderStates();
+  }
+
   async destroy(): Promise<void> {
     this.stop();
     await this.#adapter.destroy();
@@ -80,7 +111,7 @@ export class RdsReplicaBalancerController implements RdsReplicaBalancer {
   async #sync(): Promise<RdsClusterTopology> {
     const topology = await discoverRdsTopology(this.#options);
     const nextSignature = topologySignature(topology);
-    this.#adapter.applyTopology(topology);
+    await this.#adapter.applyTopology(topology);
     this.#topology = topology;
 
     if (nextSignature !== this.#signature) {
